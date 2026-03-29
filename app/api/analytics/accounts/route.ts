@@ -17,7 +17,7 @@ function googleErrorResponse(err: unknown) {
       error: message,
       code,
       hint:
-        "Configura ADC o GOOGLE_APPLICATION_CREDENTIALS, habilita Admin API y usa una identidad con acceso a GA. Ver docs/GA-SETUP.md.",
+        "En Netlify usa GOOGLE_SERVICE_ACCOUNT_JSON (JSON completo). Local: GOOGLE_APPLICATION_CREDENTIALS o ADC. Habilita Admin API. Ver docs/GA-SETUP.md.",
     },
     { status: 502 },
   );

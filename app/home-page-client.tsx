@@ -1,19 +1,110 @@
 "use client";
 
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { TrafficCharts, type TrafficChartRow } from "@/components/traffic-charts";
-import type { AccountRow } from "@/lib/ga/account-summaries";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useFitScale } from "@/hooks/use-fit-scale";
+import { DashboardMiniLineChart } from "@/components/dashboard-mini-chart";
+import { DashboardProjectCard } from "@/components/dashboard-project-card";
+import type { TrafficChartRow } from "@/components/traffic-charts";
+import {
+  filterTvActions,
+  filterTvAlerts,
+  insightMetricBadgeForLine,
+} from "@/lib/dashboard/growth-insights-filter";
+import { matchInsightLineToPropertyId } from "@/lib/dashboard/match-insight-property";
+import { pickCardInsights } from "@/lib/dashboard/pick-card-insights";
 import { formatUtcDateTimeForDisplay } from "@/lib/format-datetime";
+import { isNetlifyAuthSkipped } from "@/lib/identity";
+import { ga4PropertyReportsUrl } from "@/lib/ga/ga4-web-url";
+import type { AccountRow } from "@/lib/ga/account-summaries";
+import {
+  DASHBOARD_BRAND_ORDER,
+  dashboardBrandSortIndex,
+  getBrandVisuals,
+} from "@/lib/ga/brand-theme";
+import { inferBrandFromPropertyName } from "@/lib/ga/infer-brand";
+import {
+  inferInsightTrendFromText,
+  type InsightAlertItem,
+  type InsightTrend,
+} from "@/lib/together/summarize-traffic";
+import { ExternalLink, ListTodo } from "lucide-react";
+
+const GECKO_THRESHOLD_PCT = 15;
+const REFRESH_MS = 60 * 60 * 1000;
+
+function readKioskMode(searchParams: ReturnType<typeof useSearchParams>): boolean {
+  const v = searchParams.get("kiosk") ?? searchParams.get("tv");
+  return v === "1" || (typeof v === "string" && v.toLowerCase() === "true");
+}
+
+type TrafficRow = TrafficChartRow & {
+  priorSessions?: number;
+  priorTotalUsers?: number;
+  priorScreenPageViews?: number;
+  sessionsChangePct?: number | null;
+  totalUsersChangePct?: number | null;
+  screenPageViewsChangePct?: number | null;
+  sessionsWeekOverWeekPct?: number | null;
+  bucketSessions?: number[];
+  bucketUsers?: number[];
+  neonSubscriberChangePct?: number | null;
+};
 
 type HomeTrafficOk = {
   days: number;
-  rows: TrafficChartRow[];
+  period?: string;
+  compare?: boolean;
+  rows: TrafficRow[];
   totals: { sessions: number; totalUsers: number; screenPageViews: number };
   propertyCount: number;
   userIdFilterActive?: boolean;
   excludedUserIdCount?: number;
+  previousTotals?: { sessions: number; totalUsers: number; screenPageViews: number };
+  totalsChangePct?: {
+    sessions: number | null;
+    totalUsers: number | null;
+    screenPageViews: number | null;
+  };
+  topGrowth?: {
+    property: string;
+    propertyDisplayName: string;
+    sessionsChangePct: number;
+  } | null;
+  timeStrip?: {
+    periodKey: string;
+    bucketLabels: string[];
+    globalBucketSessions: number[];
+    globalBucketUsers: number[];
+  };
+  neonSubscribers?: {
+    byBrand: Record<string, number>;
+    errors?: Array<{ brand: string; message: string }>;
+  };
+  neonPortfolioTotal?: number;
+  neonPortfolioChangePct?: number | null;
+  neonWeeklyStrip?: {
+    labels: string[];
+    values: number[];
+    synthetic?: boolean;
+  };
+  neonWeeklyByBrand?: Record<
+    string,
+    { labels: string[]; values: number[]; synthetic: boolean }
+  >;
+  tvVisitWeekStrip?: {
+    labels: string[];
+    values: number[];
+  };
+  tvTopGrowth?: {
+    property: string;
+    propertyDisplayName: string;
+    brandShort: string;
+    sessionsChangePct: number;
+    neonSubscriberChangePct: number | null;
+  } | null;
 };
 
 type ApiOk = {
@@ -25,129 +116,167 @@ type ApiOk = {
 
 type ApiErr = { error: string; code?: string; hint?: string };
 
-const TRAFFIC_DAY_OPTIONS = [
-  { value: 7, label: "7 días" },
-  { value: 14, label: "14 días" },
-  { value: 28, label: "28 días" },
-  { value: 30, label: "30 días" },
-] as const;
+const PERIOD_OPTIONS = [
+  { value: "7" as const, label: "7d" },
+  { value: "30" as const, label: "30d" },
+  { value: "90" as const, label: "90d" },
+];
 
 function fmtTraffic(n: number) {
   return new Intl.NumberFormat("es-ES").format(Math.round(n));
 }
 
-/** Parte la respuesta de la IA en ítems (líneas que empiezan por -, •, * o 1. 2. …). */
-function parseInsightBullets(raw: string): string[] {
-  const text = raw.replace(/\r\n/g, "\n").trim();
-  if (!text) return [];
-
-  const lines = text.split("\n").map((l) => l.trimEnd());
-  const items: string[] = [];
-  let current = "";
-
-  const isBulletStart = (line: string) => {
-    const t = line.trim();
-    return /^[-*•]\s+/.test(t) || /^\d+[.)]\s+/.test(t);
+/** Texto secundario bajo KPI TV: Δ vs N días previos con flecha. */
+function fmtTvDeltaKpiLine(
+  pct: number | null | undefined,
+  compare: boolean,
+  days: number | undefined,
+): { line: string; className: string } {
+  if (!compare) return { line: "Sin comparación", className: "text-zinc-500" };
+  if (pct === null || pct === undefined) {
+    return { line: "vs periodo anterior · nuevo", className: "text-sky-400/90" };
+  }
+  const arrow = pct >= 0 ? "↑" : "↓";
+  const sign = pct >= 0 ? "+" : "";
+  const d = days ?? "—";
+  return {
+    line: `Δ vs ${d}d previos: ${arrow} ${sign}${pct.toFixed(0)}%`,
+    className:
+      pct > GECKO_THRESHOLD_PCT
+        ? "text-emerald-400"
+        : pct < -GECKO_THRESHOLD_PCT
+          ? "text-rose-400"
+          : "text-amber-300/90",
   };
+}
 
-  const stripBullet = (line: string) => {
-    const t = line.trim();
-    const sym = /^[-*•]\s+(.+)$/.exec(t);
-    if (sym) return sym[1];
-    const num = /^\d+[.)]\s+(.+)$/.exec(t);
-    if (num) return num[1];
-    return t;
-  };
+function normalizeInsightTrend(raw: unknown): InsightTrend {
+  const x = String(raw ?? "").toLowerCase();
+  if (x === "up" || x === "down" || x === "flat" || x === "nodata") return x;
+  return "flat";
+}
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    if (isBulletStart(trimmed)) {
-      if (current) items.push(current.trim());
-      current = stripBullet(trimmed);
-    } else if (current) {
-      current += " " + trimmed;
-    } else {
-      current = trimmed;
+function parseInsightAlertsFromResponse(raw: unknown): InsightAlertItem[] {
+  if (!Array.isArray(raw)) return [];
+  const out: InsightAlertItem[] = [];
+  for (const item of raw) {
+    if (typeof item === "string" && item.trim()) {
+      const text = item.trim();
+      out.push({ text, trend: inferInsightTrendFromText(text) });
+    } else if (item && typeof item === "object" && "text" in item) {
+      const t = String((item as { text: unknown }).text).trim();
+      if (t) {
+        out.push({
+          text: t,
+          trend:
+            "trend" in item
+              ? normalizeInsightTrend((item as { trend: unknown }).trend)
+              : inferInsightTrendFromText(t),
+        });
+      }
     }
   }
-  if (current) items.push(current.trim());
-
-  return items.length > 0 ? items : [text];
+  return out;
 }
 
-function softenInsightJargon(s: string): string {
-  return s
-    .replace(/\buserIdFilterActive\s+es\s+false\b/gi, "No hay filtro User-ID activo")
-    .replace(/\buserIdFilterActive\s+es\s+true\b/gi, "Hay filtro User-ID activo")
-    .replace(/\buserIdFilterActive\b/gi, "filtro User-ID");
+function trendTagTiny(t: InsightTrend): { tag: string; className: string } {
+  const base =
+    "shrink-0 rounded border px-2 py-0.5 text-center font-mono text-[10px] font-bold uppercase tracking-wide sm:text-[11px]";
+  switch (t) {
+    case "up":
+      return {
+        tag: "UP",
+        className: `${base} border-emerald-800/50 bg-emerald-950/90 text-emerald-300/95`,
+      };
+    case "down":
+      return {
+        tag: "DOWN",
+        className: `${base} border-rose-800/50 bg-rose-950/90 text-rose-300/95`,
+      };
+    case "nodata":
+      return {
+        tag: "N/D",
+        className: `${base} border-zinc-700 bg-zinc-900/90 text-zinc-500`,
+      };
+    default:
+      return {
+        tag: "FLAT",
+        className: `${base} border-amber-800/50 bg-amber-950/90 text-amber-300/95`,
+      };
+  }
 }
 
-function insightItemRichText(text: string): ReactNode {
-  const t = softenInsightJargon(text);
-  const parts = t.split(/(\*\*[^*]+\*\*)/g);
-  return parts.map((part, i) => {
-    const m = /^\*\*([^*]+)\*\*$/.exec(part);
-    if (m) {
-      return (
-        <strong key={i} className="font-semibold text-zinc-100">
-          {m[1]}
-        </strong>
-      );
-    }
-    return <span key={i}>{part}</span>;
-  });
+function gaLinkClass(tiny?: boolean) {
+  return tiny
+    ? "rounded border border-zinc-600/80 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-zinc-300 hover:border-teal-600 hover:text-teal-200"
+    : "rounded-md border border-teal-700/60 bg-teal-950/50 px-2.5 py-1.5 text-xs font-medium text-teal-100 hover:border-teal-500";
 }
 
-function insightItemIsNote(item: string): boolean {
-  return /User-ID|filtro User-ID|GA4|tráfico interno|entre propiedades/i.test(softenInsightJargon(item));
+function pulseBarClass(height: string, width: string) {
+  return `animate-pulse rounded bg-zinc-800/85 ${height} ${width}`;
 }
 
-function InsightHighlights({ text }: { text: string }) {
-  const items = useMemo(() => parseInsightBullets(text), [text]);
-
+function DashboardProjectGridSkeleton({ gridClass }: { gridClass: string }) {
   return (
-    <ul className="mt-4 space-y-0">
-      {items.map((item, idx) => {
-        const note = insightItemIsNote(item);
-        return (
-          <li
-            key={`${idx}-${item.slice(0, 24)}`}
-            className={`relative border-t border-zinc-800/90 py-4 first:border-t-0 first:pt-0 sm:py-4 ${
-              note ? "rounded-xl border border-amber-900/35 !border-t-amber-900/35 bg-amber-950/15 px-4 py-4 sm:px-5" : ""
-            }`}
-          >
-            <div className="flex gap-3 sm:gap-4">
-              <span
-                className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg font-mono text-xs font-semibold ${
-                  note
-                    ? "bg-amber-900/40 text-amber-200/95"
-                    : "bg-violet-900/45 text-violet-200/95"
-                }`}
-                aria-hidden
-              >
-                {idx + 1}
-              </span>
-              <div className="min-w-0 flex-1">
-                {note ? (
-                  <p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-amber-500/90">
-                    Nota sobre datos
-                  </p>
-                ) : null}
-                <p className="text-sm leading-relaxed text-zinc-300 sm:text-[15px] sm:leading-7">
-                  {insightItemRichText(item)}
-                </p>
-              </div>
-            </div>
-          </li>
-        );
-      })}
-    </ul>
+    <div
+      className={gridClass}
+      aria-busy
+      aria-label="Cargando proyectos"
+    >
+      {Array.from({ length: 6 }, (_, i) => (
+        <div
+          key={i}
+          className="rounded-xl border border-zinc-800/90 bg-zinc-900/50 p-3"
+        >
+          <div className={pulseBarClass("h-2.5", "w-[85%]")} />
+          <div className={`mt-3 ${pulseBarClass("h-6", "w-20")}`} />
+          <div className={`mt-2 ${pulseBarClass("h-6", "w-28")}`} />
+          <div className={`mt-3 rounded-lg bg-black/20 p-2 ${pulseBarClass("h-14", "w-full")}`} />
+        </div>
+      ))}
+    </div>
   );
 }
 
+function DashboardInsightsSkeleton() {
+  return (
+    <div className="grid grid-cols-1 gap-2 lg:grid-cols-2" aria-busy aria-label="Cargando análisis IA">
+      {[0, 1].map((col) => (
+        <div
+          key={col}
+          className="rounded-lg border border-zinc-800/80 bg-zinc-950/30 px-2 py-2 sm:px-3"
+        >
+          <div className="mb-3 flex justify-between gap-2 border-b border-zinc-800/50 pb-2">
+            <div className={pulseBarClass("h-5", "w-24")} />
+            <div className={pulseBarClass("h-3", "w-16")} />
+          </div>
+          <div className="space-y-2">
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i} className="rounded border border-zinc-800/40 bg-black/20 px-2 py-2">
+                <div className={pulseBarClass("h-2 w-full", "")} />
+                <div className={`mt-2 ${pulseBarClass("h-2", "w-[85%]")}`} />
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function insightPlainText(text: string): ReactNode {
+  const t = text
+    .replace(/\buserIdFilterActive\s+es\s+false\b/gi, "sin filtro User-ID")
+    .replace(/\buserIdFilterActive\s+es\s+true\b/gi, "filtro User-ID")
+    .replace(/\buserIdFilterActive\b/gi, "User-ID");
+  return t.replace(/\*\*([^*]+)\*\*/g, "$1");
+}
+
 export function HomePageClient() {
+  const searchParams = useSearchParams();
+  const kiosk = useMemo(() => readKioskMode(searchParams), [searchParams]);
+  const authSkipped = useMemo(() => isNetlifyAuthSkipped(), []);
+
   const [accounts, setAccounts] = useState<AccountRow[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
@@ -156,12 +285,19 @@ export function HomePageClient() {
   const [homeTrafficLoading, setHomeTrafficLoading] = useState(true);
   const [homeTrafficError, setHomeTrafficError] = useState<string | null>(null);
   const [insightsLoading, setInsightsLoading] = useState(true);
-  const [insightsText, setInsightsText] = useState<string | null>(null);
   const [insightsSkipped, setInsightsSkipped] = useState(false);
   const [insightsSkipMessage, setInsightsSkipMessage] = useState<string | null>(null);
   const [insightsError, setInsightsError] = useState<string | null>(null);
-  const [trafficDays, setTrafficDays] = useState(7);
+  const [insightAlerts, setInsightAlerts] = useState<InsightAlertItem[]>([]);
+  const [insightActions, setInsightActions] = useState<string[]>([]);
+  const [periodPreset, setPeriodPreset] = useState<"7" | "30" | "90">("30");
   const [useStoredTraffic, setUseStoredTraffic] = useState(false);
+  const [lastRefreshAt, setLastRefreshAt] = useState<Date | null>(null);
+  /** Evita que una respuesta antigua pise datos tras cambiar periodo / Neon. */
+  const trafficLoadSeq = useRef(0);
+  const [warmupError, setWarmupError] = useState<string | null>(null);
+  /** Refresco forzado + precache cron en Neon (secuencial). */
+  const [fullRefreshLoading, setFullRefreshLoading] = useState(false);
   const [meta, setMeta] = useState<{
     source: "database" | "google" | null;
     syncedAt: string | null;
@@ -235,60 +371,174 @@ export function HomePageClient() {
     void load();
   }, [load]);
 
-  const loadTrafficAndInsights = useCallback(async () => {
+  const loadTrafficAndInsights = useCallback(
+    async (opts?: { forceRefresh?: boolean }): Promise<{ ok: boolean }> => {
+    const seq = ++trafficLoadSeq.current;
+
     setHomeTrafficLoading(true);
     setInsightsLoading(true);
     setHomeTrafficError(null);
     setInsightsError(null);
     setInsightsSkipped(false);
     setInsightsSkipMessage(null);
-    setInsightsText(null);
-    try {
-      const q = new URLSearchParams({ days: String(trafficDays) });
-      if (useStoredTraffic) {
-        q.set("source", "stored");
-      }
-      const tr = await fetch(`/api/analytics/traffic?${q}`, { cache: "no-store" });
-      const tj = (await tr.json()) as HomeTrafficOk & { error?: string };
-      if (!tr.ok) {
-        setHomeTraffic(null);
-        setHomeTrafficError(tj.error ?? tr.statusText);
-        return;
-      }
-      setHomeTraffic(tj);
+    setInsightAlerts([]);
+    setInsightActions([]);
 
-      const ins = await fetch("/api/insights", {
+    const trafficQ = new URLSearchParams({
+      period: periodPreset,
+      compare: "1",
+      strip: "1",
+    });
+    if (useStoredTraffic) trafficQ.set("source", "stored");
+    if (opts?.forceRefresh) trafficQ.set("refresh", "1");
+
+    const cacheQ = new URLSearchParams({
+      period: periodPreset,
+      compare: "1",
+      source: useStoredTraffic ? "stored" : "live",
+    });
+
+    let insightsFromNeon = false;
+
+    const isStale = () => seq !== trafficLoadSeq.current;
+
+    try {
+      let trRes: Response;
+      if (opts?.forceRefresh) {
+        trRes = await fetch(`/api/analytics/traffic?${trafficQ}`, { cache: "no-store" });
+        if (isStale()) return { ok: false };
+      } else {
+        const [trP, neonRes] = await Promise.all([
+          fetch(`/api/analytics/traffic?${trafficQ}`, { cache: "no-store" }),
+          fetch(`/api/insights?${cacheQ}`, { cache: "no-store" }),
+        ]);
+        if (isStale()) return { ok: false };
+
+        const neonJson = (await neonRes.json()) as {
+          cached?: boolean;
+          alerts?: unknown;
+          actions?: string[];
+          error?: string;
+        };
+
+        if (
+          neonRes.ok &&
+          neonJson.cached === true &&
+          !neonJson.error
+        ) {
+          setInsightAlerts(parseInsightAlertsFromResponse(neonJson.alerts));
+          setInsightActions(Array.isArray(neonJson.actions) ? neonJson.actions : []);
+          setInsightsLoading(false);
+          insightsFromNeon = true;
+        }
+        trRes = trP;
+      }
+
+      const tj = (await trRes.json()) as HomeTrafficOk & {
+        error?: string;
+        hint?: string;
+        code?: string;
+      };
+
+      if (isStale()) return { ok: false };
+
+      if (!trRes.ok) {
+        setHomeTraffic(null);
+        const base = tj.error ?? trRes.statusText;
+        const hint = typeof tj.hint === "string" && tj.hint.trim() ? `\n\n${tj.hint}` : "";
+        setHomeTrafficError(`${base}${hint}`);
+        return { ok: false };
+      }
+
+      setHomeTraffic(tj);
+      setLastRefreshAt(new Date());
+
+      if (insightsFromNeon) {
+        return { ok: true };
+      }
+
+      const insightUrl = opts?.forceRefresh ? "/api/insights?refresh=1" : "/api/insights";
+      const ins = await fetch(insightUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(tj),
+        body: JSON.stringify({
+          ...tj,
+          _insightsCacheSource: useStoredTraffic ? "stored" : "live",
+        }),
       });
       const ij = (await ins.json()) as {
         skipped?: boolean;
         message?: string;
         error?: string;
-        text?: string;
+        alerts?: unknown;
+        actions?: string[];
       };
+
+      if (isStale()) return { ok: false };
+
       if (ins.status === 503 && ij.skipped) {
         setInsightsSkipped(true);
         setInsightsSkipMessage(ij.message ?? null);
-        return;
+        return { ok: true };
       }
       if (!ins.ok) {
-        setInsightsError(ij.error ?? "No se pudo generar el resumen");
+        setInsightsError(ij.error ?? "IA");
+        return { ok: false };
+      }
+      setInsightAlerts(parseInsightAlertsFromResponse(ij.alerts));
+      setInsightActions(Array.isArray(ij.actions) ? ij.actions : []);
+      return { ok: true };
+    } catch (e) {
+      if (isStale()) return { ok: false };
+      setHomeTrafficError(e instanceof Error ? e.message : "Red");
+      if (!insightsFromNeon) {
+        setInsightsError(e instanceof Error ? e.message : "Red");
+      }
+      return { ok: false };
+    } finally {
+      if (seq === trafficLoadSeq.current) {
+        setHomeTrafficLoading(false);
+        if (!insightsFromNeon) {
+          setInsightsLoading(false);
+        }
+      }
+    }
+  },
+    [periodPreset, useStoredTraffic],
+  );
+
+  /** GA4 + IA con refresh=1 (Neon), luego precache de periodos como el cron. */
+  const refreshAllAndPrecacheNeon = useCallback(async () => {
+    setFullRefreshLoading(true);
+    setWarmupError(null);
+    try {
+      const first = await loadTrafficAndInsights({ forceRefresh: true });
+      if (!first.ok) {
         return;
       }
-      setInsightsText(ij.text ?? null);
+      const res = await fetch("/api/insights/warmup", { method: "POST" });
+      const j = (await res.json()) as { ok?: boolean; error?: string; results?: unknown };
+      if (!res.ok) {
+        setWarmupError(typeof j.error === "string" ? j.error : res.statusText);
+        return;
+      }
+      await loadTrafficAndInsights();
     } catch (e) {
-      setHomeTrafficError(e instanceof Error ? e.message : "Error de red (tráfico)");
-      setInsightsError(e instanceof Error ? e.message : "Error de red (IA)");
+      setWarmupError(e instanceof Error ? e.message : "Red");
     } finally {
-      setHomeTrafficLoading(false);
-      setInsightsLoading(false);
+      setFullRefreshLoading(false);
     }
-  }, [trafficDays, useStoredTraffic]);
+  }, [loadTrafficAndInsights]);
 
   useEffect(() => {
     void loadTrafficAndInsights();
+  }, [loadTrafficAndInsights]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      void loadTrafficAndInsights();
+    }, REFRESH_MS);
+    return () => window.clearInterval(id);
   }, [loadTrafficAndInsights]);
 
   const stats = useMemo(() => {
@@ -299,395 +549,594 @@ export function HomePageClient() {
     return { accounts: accounts.length, properties };
   }, [accounts]);
 
-  const sourceLabel =
-    meta.source === "database"
-      ? "Neon"
-      : meta.source === "google"
-        ? "Google en vivo"
-        : "—";
+  const compareActive = Boolean(homeTraffic?.compare);
 
-  return (
-    <div className="min-h-full bg-[#0f1419] text-zinc-100">
-      <div className="mx-auto max-w-6xl px-6 py-10 sm:py-14">
-        <div className="mb-10 flex flex-col gap-6 border-b border-zinc-800/80 pb-8 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <p className="font-mono text-xs uppercase tracking-[0.2em] text-teal-500/90">Metrics</p>
-            <h1 className="mt-1 text-2xl font-semibold tracking-tight text-white sm:text-3xl">
-              Panel Google Analytics 4
-            </h1>
-            <p className="mt-2 max-w-xl text-sm text-zinc-500">
-              Inventario de cuentas y propiedades, sincronización con Neon y análisis de visitas con gráficos.
-            </p>
-          </div>
-          <nav className="flex flex-wrap gap-2" aria-label="Secciones">
-            <span className="inline-flex items-center rounded-full border border-teal-600/50 bg-teal-950/40 px-4 py-2 text-sm font-medium text-teal-100">
-              Inventario
-            </span>
-            <Link
-              href="/traffic"
-              className="inline-flex items-center rounded-full border border-zinc-700 bg-zinc-900/60 px-4 py-2 text-sm font-medium text-zinc-300 transition hover:border-violet-500/60 hover:bg-violet-950/30 hover:text-violet-200"
-            >
-              Tráfico y gráficos
-            </Link>
-          </nav>
-        </div>
+  const projectCardRows = useMemo(() => {
+    if (!homeTraffic?.rows.length) return [];
+    const copy = [...homeTraffic.rows];
+    copy.sort((a, b) => {
+      const ba = inferBrandFromPropertyName(a.propertyDisplayName);
+      const bb = inferBrandFromPropertyName(b.propertyDisplayName);
+      const ia = dashboardBrandSortIndex(ba);
+      const ib = dashboardBrandSortIndex(bb);
+      if (ia !== ib) return ia - ib;
+      return a.propertyDisplayName.localeCompare(b.propertyDisplayName, "es");
+    });
+    return copy;
+  }, [homeTraffic?.rows]);
 
+  /** Hasta 5 marcas: una sola fila en desktop (menos hueco vacío a la derecha). */
+  const projectGridClass = useMemo(() => {
+    const n = projectCardRows.length;
+    if (n <= 0) return "grid w-full grid-cols-1 gap-1.5";
+    if (n <= 5) {
+      return "grid w-full grid-cols-1 content-start gap-1.5 pr-0.5 [scrollbar-gutter:stable] sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5";
+    }
+    if (n <= 6) {
+      return "grid w-full grid-cols-1 content-start gap-1.5 pr-0.5 [scrollbar-gutter:stable] sm:grid-cols-2 lg:grid-cols-3";
+    }
+    return "grid w-full grid-cols-1 content-start gap-1.5 pr-0.5 [scrollbar-gutter:stable] sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4";
+  }, [projectCardRows.length]);
+
+  const trafficRowsForInsights = homeTraffic?.rows ?? [];
+  const canFilterInsightsByBrand = trafficRowsForInsights.length > 0;
+
+  const insightsByPropertyId = useMemo(() => {
+    const rows = homeTraffic?.rows ?? [];
+    const m = new Map<
+      string,
+      ReturnType<typeof pickCardInsights>
+    >();
+    for (const r of rows) {
+      m.set(r.property, pickCardInsights(r.property, rows, insightAlerts, insightActions));
+    }
+    return m;
+  }, [homeTraffic?.rows, insightAlerts, insightActions]);
+
+  const tvAlertItems = useMemo(() => filterTvAlerts(insightAlerts, 3), [insightAlerts]);
+  const tvActionLines = useMemo(
+    () =>
+      trafficRowsForInsights.length > 0
+        ? filterTvActions(insightActions, trafficRowsForInsights, 8)
+        : insightActions.slice(0, 8),
+    [insightActions, trafficRowsForInsights],
+  );
+
+  const portfolioInsightVisuals = getBrandVisuals("Otros");
+
+  const insightsUnavailableNoteGlobal =
+    insightsError ?? (insightsSkipped ? insightsSkipMessage : null);
+
+  const portfolioSummary = useMemo(() => {
+    if (!homeTraffic) return null;
+    const visitDelta = fmtTvDeltaKpiLine(
+      homeTraffic.totalsChangePct?.sessions,
+      compareActive,
+      homeTraffic.days,
+    );
+    const neonDelta =
+      homeTraffic.neonPortfolioTotal === undefined
+        ? { line: "Inscritos Neon: configura NEON_SUBSCRIBER_SOURCES", className: "text-zinc-500" }
+        : homeTraffic.neonPortfolioChangePct === null ||
+            homeTraffic.neonPortfolioChangePct === undefined
+          ? {
+              line: "Δ inscritos cartera: sin histórico (subscriber_portfolio_daily)",
+              className: "text-zinc-500",
+            }
+          : fmtTvDeltaKpiLine(
+              homeTraffic.neonPortfolioChangePct,
+              true,
+              homeTraffic.days,
+            );
+    return {
+      visitDelta,
+      neonDelta,
+      days: homeTraffic.days,
+      totalSessions: homeTraffic.totals.sessions,
+      totalUsers: homeTraffic.totals.totalUsers,
+      neonTotal: homeTraffic.neonPortfolioTotal,
+    };
+  }, [homeTraffic, compareActive]);
+
+  const { containerRef: fitContainerRef, contentRef: fitContentRef, scale: fitScale } =
+    useFitScale([
+      projectCardRows.length,
+      homeTrafficLoading,
+      insightsLoading,
+      insightAlerts.length,
+      insightActions.length,
+      portfolioSummary?.days,
+      portfolioSummary?.totalSessions,
+      homeTraffic?.tvVisitWeekStrip?.labels?.length ?? 0,
+    ]);
+
+  const controlBar = (
+    <>
+      {!kiosk ? (
+        <label
+          className="flex cursor-pointer touch-manipulation items-center gap-2 rounded border border-zinc-800/80 bg-zinc-900/40 px-2 py-1.5 max-sm:min-h-10"
+          title={
+            meta.persistEnabled
+              ? "Listado de propiedades desde snapshot en Neon (menos llamadas a Admin API)"
+              : "Sin snapshot en Neon aún: sincroniza cuentas (panel abajo) para que «Neon» use la lista guardada; si no, GA4 sigue en vivo."
+          }
+        >
+          <input
+            type="checkbox"
+            checked={useStoredTraffic}
+            onChange={(e) => setUseStoredTraffic(e.target.checked)}
+            className="h-4 w-4 cursor-pointer rounded border-zinc-600 max-sm:h-[1.15rem] max-sm:w-[1.15rem]"
+          />
+          <span className="font-mono text-xs text-zinc-400 max-sm:text-sm">Neon</span>
+        </label>
+      ) : null}
+      {!kiosk ? (
         <Link
           href="/traffic"
-          className="group mb-10 block rounded-2xl border border-violet-800/40 bg-gradient-to-br from-violet-950/35 via-zinc-900/40 to-zinc-950 p-6 shadow-lg shadow-black/20 transition hover:border-violet-600/50 hover:from-violet-950/50 sm:p-8"
+          className="inline-flex min-h-10 items-center font-mono text-xs text-violet-300 underline-offset-2 max-sm:px-1 hover:underline sm:text-sm"
         >
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="text-xs font-medium uppercase tracking-wider text-violet-400/90">Análisis</p>
-              <h2 className="mt-1 text-xl font-semibold text-white sm:text-2xl">
-                Ver visitas en todos los sites
-              </h2>
-              <p className="mt-2 max-w-2xl text-sm leading-relaxed text-zinc-400">
-                Barras por propiedad, reparto de sesiones, tabla detallada y opción de desglose por{" "}
-                <span className="text-zinc-300">país</span> (más lento).
-              </p>
-            </div>
-            <span className="shrink-0 self-start rounded-lg bg-violet-600/20 px-4 py-2.5 text-sm font-medium text-violet-200 transition group-hover:bg-violet-600/35 sm:self-center">
-              Abrir tráfico →
-            </span>
-          </div>
+          Detalle
         </Link>
-
-        <section className="mb-12 rounded-2xl border border-emerald-900/30 bg-zinc-950/40 p-5 sm:p-7">
-          <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <p className="font-mono text-xs uppercase tracking-wider text-emerald-500/90">
-                Últimos {trafficDays} días
-              </p>
-              <h2 className="mt-1 text-xl font-semibold text-white">Resumen de visitas en el panel</h2>
-              <p className="mt-2 max-w-2xl text-sm text-zinc-500">
-                Misma consulta que{" "}
-                <Link href="/traffic" className="text-emerald-400/90 underline-offset-2 hover:underline">
-                  Tráfico
-                </Link>{" "}
-                (sin países aquí; el desglose por país y la tabla detallada están en esa página). Los destacados los
-                genera Together con{" "}
-                <code className="rounded bg-zinc-800/60 px-1 font-mono text-[11px] text-zinc-300">TOGETHER_API_KEY</code>{" "}
-                en{" "}
-                <code className="rounded bg-zinc-800/60 px-1 font-mono text-[11px] text-zinc-300">.env.local</code>;
-                reinicia{" "}
-                <code className="rounded bg-zinc-800/60 px-1 font-mono text-[11px] text-zinc-300">npm run dev</code>{" "}
-                tras guardarla.
-              </p>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {homeTraffic?.userIdFilterActive ? (
-                <span className="rounded-full border border-amber-800/50 bg-amber-950/40 px-3 py-1 text-xs text-amber-200/90">
-                  Filtro User-ID activo ({homeTraffic.excludedUserIdCount ?? 0} id)
-                </span>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => void loadTrafficAndInsights()}
-                disabled={homeTrafficLoading || insightsLoading}
-                className="rounded-lg border border-emerald-700/50 bg-emerald-950/40 px-3 py-1.5 text-sm font-medium text-emerald-100 hover:border-emerald-500 disabled:opacity-50"
-              >
-                {homeTrafficLoading || insightsLoading ? "Actualizando…" : "Actualizar gráficos e IA"}
-              </button>
-            </div>
-          </div>
-
-          <div className="mb-6 flex flex-wrap items-center gap-4 border-b border-zinc-800/80 pb-6">
-            <label className="flex items-center gap-2 text-sm text-zinc-400">
-              <span>Rango</span>
-              <select
-                value={trafficDays}
-                onChange={(e) => setTrafficDays(Number(e.target.value))}
-                className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-zinc-100"
-              >
-                {TRAFFIC_DAY_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label
-              className={`flex items-center gap-2 text-sm ${meta.persistEnabled ? "cursor-pointer text-zinc-400" : "cursor-not-allowed text-zinc-600"}`}
+      ) : (
+        <Link
+          href="/"
+          className="font-mono text-[9px] text-zinc-600 hover:text-zinc-400"
+          title="Salir del modo kiosko"
+        >
+          Panel
+        </Link>
+      )}
+      {!kiosk ? (
+        <button
+          type="button"
+          onClick={() => void refreshAllAndPrecacheNeon()}
+          disabled={fullRefreshLoading || homeTrafficLoading || insightsLoading}
+          title="Actualiza tráfico GA4 e IA (sin leer caché), guarda en Neon; luego precalienta todos los periodos del cron (INSIGHTS_CRON_*)."
+          className="hidden touch-manipulation rounded border border-emerald-800/55 bg-emerald-950/45 px-2.5 py-1.5 font-mono text-[10px] font-semibold text-emerald-200/95 disabled:opacity-40 sm:inline-flex sm:min-h-0 sm:items-center"
+        >
+          {fullRefreshLoading ? "…" : "Refrescar + Neon"}
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={() => void refreshAllAndPrecacheNeon()}
+          disabled={fullRefreshLoading || homeTrafficLoading || insightsLoading}
+          title="Refrescar todo y precachear en Neon"
+          className="inline-flex min-h-8 touch-manipulation items-center rounded border border-emerald-800/60 bg-emerald-950/40 px-2 py-1 font-mono text-[10px] text-emerald-300 disabled:opacity-40"
+        >
+          {fullRefreshLoading ? "…" : "↻"}
+        </button>
+      )}
+      {warmupError ? (
+        <span
+          className="max-w-56 truncate font-mono text-[10px] text-rose-400/95 max-sm:max-w-full"
+          title={warmupError}
+        >
+          {warmupError}
+        </span>
+      ) : null}
+      {lastRefreshAt ? (
+        <span className="font-mono text-[10px] text-zinc-500 max-sm:text-xs" title="Auto cada 1h">
+          {lastRefreshAt.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}
+        </span>
+      ) : null}
+      <div className="flex w-full justify-end sm:ml-auto sm:w-auto">
+        <div
+          className="flex touch-manipulation rounded-lg border border-zinc-600/90 bg-zinc-900/95 p-0.5 shadow-md"
+          title="Rango del panel (visitas e inscritos)"
+        >
+          {PERIOD_OPTIONS.map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              onClick={() => setPeriodPreset(o.value)}
+              className={`rounded-md px-3 py-1.5 font-mono text-xs font-bold max-sm:min-h-10 max-sm:min-w-[3rem] max-sm:text-sm ${
+                periodPreset === o.value
+                  ? "bg-teal-600 text-white shadow-sm"
+                  : "text-zinc-400 hover:text-zinc-100"
+              }`}
             >
-              <input
-                type="checkbox"
-                checked={useStoredTraffic}
-                disabled={!meta.persistEnabled}
-                onChange={(e) => setUseStoredTraffic(e.target.checked)}
-                className="rounded border-zinc-600 disabled:opacity-50"
-              />
-              Lista de propiedades desde Neon
-            </label>
-            {!meta.persistEnabled ? (
-              <span className="text-xs text-zinc-600">Neon requiere DATABASE_URL</span>
-            ) : null}
-          </div>
+              {o.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    </>
+  );
 
-          {homeTrafficError ? (
-            <p className="mb-4 text-sm text-rose-400/90">{homeTrafficError}</p>
-          ) : null}
-
-          {homeTrafficLoading && !homeTraffic ? (
-            <p className="animate-pulse text-zinc-500">Cargando métricas de tráfico…</p>
-          ) : null}
-
-          {homeTraffic && homeTraffic.rows.length > 0 ? (
-            <>
-              <div className="mb-6 flex flex-wrap gap-3 text-sm">
-                <span className="rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-2 text-zinc-300">
-                  <span className="text-zinc-500">Sesiones</span>{" "}
-                  <span className="font-mono tabular-nums text-emerald-200/90">
-                    {fmtTraffic(homeTraffic.totals.sessions)}
-                  </span>
-                </span>
-                <span className="rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-2 text-zinc-300">
-                  <span className="text-zinc-500">Usuarios</span>{" "}
-                  <span className="font-mono tabular-nums text-emerald-200/90">
-                    {fmtTraffic(homeTraffic.totals.totalUsers)}
-                  </span>
-                </span>
-                <span className="rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-2 text-zinc-300">
-                  <span className="text-zinc-500">Vistas</span>{" "}
-                  <span className="font-mono tabular-nums text-emerald-200/90">
-                    {fmtTraffic(homeTraffic.totals.screenPageViews)}
-                  </span>
-                </span>
-                <span className="rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-zinc-500">
-                  {homeTraffic.propertyCount} propiedades
-                </span>
-              </div>
-              <TrafficCharts rows={homeTraffic.rows} days={homeTraffic.days} compact />
-            </>
-          ) : null}
-
-          {homeTraffic && homeTraffic.rows.length === 0 && !homeTrafficLoading ? (
-            <p className="text-sm text-zinc-500">Sin propiedades para mostrar en el resumen de tráfico.</p>
-          ) : null}
-
-          <div className="mt-8 overflow-hidden rounded-2xl border border-violet-900/30 bg-gradient-to-b from-violet-950/20 via-zinc-950/50 to-zinc-950/80 shadow-lg shadow-black/20">
-            <div className="border-b border-violet-900/25 bg-violet-950/25 px-4 py-4 sm:px-6 sm:py-5">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <h3 className="text-base font-semibold tracking-tight text-white">Destacados (IA)</h3>
-                  <p className="mt-1 text-xs text-zinc-500">
-                    Resumen automático a partir de tus métricas; revisa cifras en los gráficos de arriba.
-                  </p>
-                </div>
-                <span className="inline-flex w-fit shrink-0 items-center rounded-full border border-violet-700/40 bg-violet-950/50 px-3 py-1 text-[11px] font-medium uppercase tracking-wide text-violet-300/90">
-                  Together
-                </span>
-              </div>
+  return (
+    <div className="flex max-h-dvh min-h-dvh flex-col overflow-hidden bg-[#07090c] font-sans text-zinc-100 max-sm:max-h-dvh max-sm:min-h-dvh">
+      <header
+        className={`relative z-20 shrink-0 border-b border-zinc-800/80 pt-[env(safe-area-inset-top,0px)] ${
+          kiosk
+            ? "flex flex-wrap items-center justify-between gap-2 px-2 py-1"
+            : "flex flex-col gap-2 px-3 py-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-2 sm:px-4"
+        }`}
+      >
+        {kiosk ? (
+          <>
+            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+              <h1 className="truncate font-mono text-xs font-semibold uppercase tracking-[0.18em] text-zinc-300 sm:text-[13px]">
+                GA4 · TV
+              </h1>
+              <span className="font-mono text-[10px] text-zinc-500">kiosk</span>
             </div>
-            <div className="px-4 pb-2 pt-1 sm:px-6 sm:pb-4">
-              {insightsLoading ? (
-                <div className="py-8">
-                  <div className="mx-auto h-1 max-w-xs overflow-hidden rounded-full bg-zinc-800">
-                    <div className="h-full w-1/2 animate-pulse rounded-full bg-violet-500/60" />
-                  </div>
-                  <p className="mt-4 text-center text-sm text-zinc-500">Generando resumen…</p>
-                </div>
-              ) : null}
-              {!insightsLoading && insightsSkipped && insightsSkipMessage ? (
-                <p className="py-6 text-sm leading-relaxed text-zinc-400">{insightsSkipMessage}</p>
-              ) : null}
-              {!insightsLoading && insightsError ? (
-                <p className="py-6 text-sm text-rose-400/90">{insightsError}</p>
-              ) : null}
-              {!insightsLoading && insightsText ? <InsightHighlights text={insightsText} /> : null}
-              {!insightsLoading && !insightsSkipped && !insightsError && !insightsText && homeTraffic?.rows.length ? (
-                <p className="py-6 text-sm text-zinc-500">Sin texto de IA.</p>
-              ) : null}
+            <div
+              className={`flex flex-wrap items-center gap-1.5 sm:gap-2 ${authSkipped ? "" : "sm:pr-28"}`}
+            >
+              {controlBar}
             </div>
-          </div>
-        </section>
-
-        <section id="inventario" className="mb-10">
-          <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-            <div>
-              <h2 className="text-lg font-semibold text-white">Inventario</h2>
-              <p className="mt-1 text-sm text-zinc-500">
-                Cuentas y propiedades visibles para tu cuenta de servicio. Con Neon guardas una copia local.
-              </p>
-            </div>
-            {!loading && accounts && accounts.length > 0 ? (
-              <div className="flex flex-wrap gap-2 text-sm">
-                <span className="rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-zinc-300">
-                  <span className="font-mono text-teal-400/90">{stats.accounts}</span> cuentas
-                </span>
-                <span className="rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-zinc-300">
-                  <span className="font-mono text-teal-400/90">{stats.properties}</span> propiedades
-                </span>
-                <span className="rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-zinc-400">
-                  Origen: <span className="text-zinc-200">{sourceLabel}</span>
-                </span>
-                {meta.syncedAt ? (
-                  <span className="rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-zinc-500">
-                    Sync BD:{" "}
-                    <span className="font-mono text-xs text-zinc-400">
-                      {formatUtcDateTimeForDisplay(meta.syncedAt)}
-                    </span>
+          </>
+        ) : (
+          <>
+            <div className="flex w-full items-center justify-between gap-2 sm:hidden">
+              <div className="flex min-w-0 items-center gap-2">
+                <h1 className="truncate font-mono text-[13px] font-semibold uppercase tracking-[0.16em] text-zinc-300">
+                  GA4 · TV
+                </h1>
+                {homeTraffic?.userIdFilterActive ? (
+                  <span className="shrink-0 rounded bg-amber-950/50 px-2 py-0.5 font-mono text-[10px] text-amber-200/95">
+                    UID
                   </span>
                 ) : null}
               </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void refreshAllAndPrecacheNeon()}
+                  disabled={fullRefreshLoading || homeTrafficLoading || insightsLoading}
+                  title="Actualiza GA4 e IA (sin caché), guarda en Neon y precalienta periodos del cron"
+                  className="touch-manipulation rounded-lg border border-emerald-800/55 bg-emerald-950/45 px-3 py-2 font-mono text-[11px] font-semibold text-emerald-200/95 disabled:opacity-40"
+                >
+                  {fullRefreshLoading ? "…" : "Refrescar + Neon"}
+                </button>
+              </div>
+            </div>
+            <div className="hidden min-w-0 items-center gap-2 sm:flex sm:gap-3">
+              <h1 className="truncate font-mono text-xs font-semibold uppercase tracking-[0.18em] text-zinc-300 sm:text-[13px]">
+                GA4 · TV
+              </h1>
+              {homeTraffic?.userIdFilterActive ? (
+                <span className="hidden rounded bg-amber-950/50 px-2 py-0.5 font-mono text-[10px] text-amber-200/95 sm:inline">
+                  UID
+                </span>
+              ) : null}
+            </div>
+            <div
+              className={`flex w-full flex-wrap items-center gap-2 max-sm:justify-between sm:w-auto sm:justify-end ${authSkipped ? "" : "sm:pr-28"}`}
+            >
+              {controlBar}
+            </div>
+          </>
+        )}
+      </header>
+
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div
+          ref={fitContainerRef}
+          className={`touch-pan-y-safe mx-auto flex min-h-0 w-full max-w-[1440px] flex-1 flex-col overflow-hidden max-sm:pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] ${
+            kiosk ? "p-1.5 sm:p-2" : "p-2.5 sm:p-4"
+          }`}
+        >
+        <div
+          ref={fitContentRef}
+          className={`flex w-full flex-col origin-top ${kiosk ? "gap-1.5" : "gap-2"}`}
+          style={{
+            transform: `scale(${fitScale})`,
+            transformOrigin: "top center",
+            ...(fitScale < 1 ? { width: `${100 / fitScale}%` } : {}),
+          }}
+        >
+        {homeTrafficError ? (
+          <div
+            className="shrink-0 rounded-xl border border-rose-800/70 bg-rose-950/40 px-4 py-4 font-sans shadow-[0_0_24px_rgba(127,29,29,0.15)]"
+            role="alert"
+          >
+            <p className="text-xs font-semibold uppercase tracking-wide text-rose-300">
+              Tráfico GA4 no disponible
+            </p>
+            <p className="mt-2 text-sm leading-relaxed text-rose-50/95">{homeTrafficError}</p>
+            <p className="mt-3 text-xs leading-relaxed text-rose-100/90">
+              En <strong className="font-medium text-rose-100/90">Netlify</strong>: Site configuration →
+              Environment variables → crea{" "}
+              <code className="rounded bg-black/35 px-1.5 py-0.5 font-mono text-[11px] text-rose-50/95">
+                GOOGLE_SERVICE_ACCOUNT_JSON
+              </code>{" "}
+              (pega el JSON completo de la cuenta de servicio de Google Cloud) y{" "}
+              <code className="rounded bg-black/35 px-1.5 py-0.5 font-mono text-[11px] text-rose-50/95">
+                GOOGLE_CLOUD_PROJECT
+              </code>
+              . Las rutas locales al archivo no existen en el servidor; luego redeploy.
+            </p>
+          </div>
+        ) : null}
+
+        {/* Resumen cartera + grid de tarjetas por proyecto */}
+        {portfolioSummary && !homeTrafficLoading ? (
+          <div className="flex shrink-0 flex-col gap-1.5 rounded-md border border-zinc-800/70 bg-zinc-950/60 px-2 py-1 sm:flex-row sm:items-center sm:gap-2 sm:py-1.5">
+            <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2.5 gap-y-1 text-[10px] leading-tight text-zinc-400 sm:text-[11px]">
+              <span className="font-semibold uppercase tracking-wide text-zinc-500">
+                Cartera · {portfolioSummary.days}d
+              </span>
+              <span>
+                Visitas GA4{" "}
+                <span className="font-mono font-semibold text-zinc-100">
+                  {fmtTraffic(portfolioSummary.totalSessions)}
+                </span>
+                <span className={` ml-1.5 ${portfolioSummary.visitDelta.className}`}>
+                  · {portfolioSummary.visitDelta.line}
+                </span>
+              </span>
+              <span>
+                Usuarios GA4{" "}
+                <span className="font-mono font-semibold text-zinc-100">
+                  {fmtTraffic(portfolioSummary.totalUsers)}
+                </span>
+              </span>
+              <span>
+                Inscritos Neon{" "}
+                <span className="font-mono font-semibold text-cyan-200/95">
+                  {portfolioSummary.neonTotal !== undefined
+                    ? fmtTraffic(portfolioSummary.neonTotal)
+                    : "—"}
+                </span>
+                <span className={` ml-1.5 ${portfolioSummary.neonDelta.className}`}>
+                  · {portfolioSummary.neonDelta.line}
+                </span>
+              </span>
+              {homeTraffic?.tvTopGrowth ? (
+                <span className="text-emerald-400/95">
+                  Top Δ visitas:{" "}
+                  <span className="font-mono font-semibold">{homeTraffic.tvTopGrowth.brandShort}</span>{" "}
+                  {homeTraffic.tvTopGrowth.sessionsChangePct >= 0 ? "+" : ""}
+                  {homeTraffic.tvTopGrowth.sessionsChangePct.toFixed(0)}%
+                </span>
+              ) : null}
+            </div>
+            {homeTraffic?.tvVisitWeekStrip &&
+            homeTraffic.tvVisitWeekStrip.labels.length >= 2 &&
+            homeTraffic.tvVisitWeekStrip.labels.length === homeTraffic.tvVisitWeekStrip.values.length ? (
+              <div className="h-[3.25rem] w-full shrink-0 sm:h-[3rem] sm:w-[min(100%,200px)]">
+                <DashboardMiniLineChart
+                  title="Visitas agregadas cartera GA4"
+                  labels={homeTraffic.tvVisitWeekStrip.labels}
+                  values={homeTraffic.tvVisitWeekStrip.values}
+                  variant="visits"
+                  micro
+                  hideTitle
+                />
+              </div>
             ) : null}
           </div>
+        ) : null}
 
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/30 p-4 sm:p-5">
-            <div className="flex flex-wrap gap-3">
+        {homeTrafficLoading && !homeTraffic ? (
+          <DashboardProjectGridSkeleton gridClass={projectGridClass} />
+        ) : homeTraffic && projectCardRows.length > 0 ? (
+          <div className={projectGridClass}>
+            {projectCardRows.map((r) => {
+              const brand = inferBrandFromPropertyName(r.propertyDisplayName);
+              const nw = homeTraffic.neonWeeklyByBrand?.[brand];
+              const cardInsight =
+                insightsByPropertyId.get(r.property) ?? { alert: null, action: null };
+              const stripLabels = homeTraffic.timeStrip?.bucketLabels ?? null;
+              const buckets = r.bucketSessions ?? null;
+              const labelsForBuckets =
+                stripLabels &&
+                buckets &&
+                stripLabels.length === buckets.length
+                  ? stripLabels
+                  : null;
+              return (
+                <DashboardProjectCard
+                  key={r.property}
+                  propertyId={r.property}
+                  displayName={r.propertyDisplayName}
+                  brand={brand}
+                  days={homeTraffic.days}
+                  sessions={r.sessions}
+                  sessionsChangePct={r.sessionsChangePct}
+                  compareActive={compareActive}
+                  sessionsLast7Days={r.sessionsLast7Days}
+                  sessionsWeekOverWeekPct={r.sessionsWeekOverWeekPct}
+                  neonSubscriberCount={r.neonSubscriberCount ?? null}
+                  neonSubscriberChangePct={r.neonSubscriberChangePct ?? null}
+                  neonWeeklyValues={nw?.values ?? null}
+                  neonWeeklyLabels={nw?.labels ?? null}
+                  neonWeeklySynthetic={nw?.synthetic ?? false}
+                  visitBucketLabels={labelsForBuckets}
+                  visitBucketSessions={buckets}
+                  insightAlert={cardInsight.alert}
+                  insightAction={cardInsight.action}
+                  insightsLoading={insightsLoading}
+                  insightsUnavailableNote={insightsUnavailableNoteGlobal}
+                />
+              );
+            })}
+          </div>
+        ) : null}
+
+        {/* Alertas + próximos pasos (portafolio: una acción por marca) */}
+        <div className="shrink-0 space-y-3">
+          {insightsLoading ? <DashboardInsightsSkeleton /> : null}
+          {!insightsLoading &&
+          !canFilterInsightsByBrand &&
+          (insightAlerts.length > 0 || insightActions.length > 0) &&
+          homeTrafficLoading ? (
+            <p className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+              IA desde caché Neon · al cargar GA4 se enlazan alertas a cada propiedad
+            </p>
+          ) : null}
+          {!insightsLoading && insightsSkipped && insightsSkipMessage ? (
+            <div className="rounded-lg border border-zinc-800 px-3 py-2.5 text-sm text-zinc-400">
+              {insightsSkipMessage}
+            </div>
+          ) : null}
+          {!insightsLoading && insightsError ? (
+            <div className="rounded-lg border border-rose-900/40 px-3 py-2.5 text-sm text-rose-300">
+              {insightsError}
+            </div>
+          ) : null}
+          {!insightsLoading && !insightsSkipped && !insightsError ? (
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <div
+                className={`flex min-h-0 max-sm:max-h-none flex-col rounded-xl border px-3 py-2 ring-1 ring-inset max-sm:min-h-40 sm:max-h-[min(32vh,14rem)] sm:px-3.5 sm:py-2.5 ${portfolioInsightVisuals.cardShell} ${portfolioInsightVisuals.cardRing}`}
+              >
+                <div className="mb-1.5 flex shrink-0 items-center justify-between gap-2 border-b border-zinc-800/50 pb-2">
+                  <span
+                    className={`max-w-[70%] truncate rounded-full px-2.5 py-1 font-mono text-[10px] font-semibold tracking-wide sm:text-[11px] ${portfolioInsightVisuals.pill}`}
+                    title="Todas las marcas y propiedades"
+                  >
+                    Portafolio
+                  </span>
+                  <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-zinc-400 sm:text-[11px]">
+                    Crecimiento (máx. 3)
+                  </span>
+                </div>
+                <ul className="min-h-0 flex-1 space-y-1.5 overflow-hidden">
+                  {tvAlertItems.length === 0 ? (
+                    <li className="text-sm text-zinc-500">
+                      Sin alertas de crecimiento/caída en el periodo.
+                    </li>
+                  ) : (
+                    tvAlertItems.map((item, idx) => {
+                      const line = item.text;
+                      const tt = trendTagTiny(item.trend);
+                      const pid = homeTraffic
+                        ? matchInsightLineToPropertyId(line, homeTraffic.rows)
+                        : null;
+                      const metricBadge = insightMetricBadgeForLine(line);
+                      return (
+                        <li
+                          key={`${idx}-${line.slice(0, 24)}`}
+                          className="flex items-start justify-between gap-2 rounded-lg border border-zinc-800/50 bg-black/25 px-2.5 py-2"
+                        >
+                          <div className="min-w-0 flex-1">
+                            {metricBadge ? (
+                              <span className="mb-1 inline-block rounded border border-zinc-600/80 bg-zinc-900/80 px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wide text-teal-300/95">
+                                {metricBadge}
+                              </span>
+                            ) : null}
+                            <p className="text-xs leading-relaxed text-zinc-200 sm:text-sm">
+                              {insightPlainText(line)}
+                            </p>
+                            {pid ? (
+                              <a
+                                href={ga4PropertyReportsUrl(pid)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="mt-1.5 inline-flex items-center gap-1 text-xs font-medium text-violet-400 hover:text-violet-300 hover:underline sm:text-sm"
+                              >
+                                Abrir en GA4
+                                <ExternalLink className="h-3.5 w-3.5 shrink-0 opacity-90" aria-hidden />
+                              </a>
+                            ) : null}
+                          </div>
+                          <span className={`w-10 shrink-0 ${tt.className}`}>{tt.tag}</span>
+                        </li>
+                      );
+                    })
+                  )}
+                </ul>
+              </div>
+              <div
+                className={`flex min-h-0 max-sm:max-h-none flex-col rounded-xl border px-3 py-2 ring-1 ring-inset max-sm:min-h-40 sm:max-h-[min(32vh,14rem)] sm:px-3.5 sm:py-2.5 ${portfolioInsightVisuals.cardShell} ${portfolioInsightVisuals.cardRing}`}
+              >
+                <div className="mb-1.5 flex shrink-0 items-center justify-between gap-2 border-b border-zinc-800/50 pb-2">
+                  <span
+                    className={`max-w-[70%] truncate rounded-full px-2.5 py-1 font-mono text-[10px] font-semibold tracking-wide sm:text-[11px] ${portfolioInsightVisuals.pill}`}
+                    title="Una acción prioritaria por marca"
+                  >
+                    Portafolio
+                  </span>
+                  <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-zinc-400 sm:text-[11px]">
+                    Próximos pasos (1 por marca)
+                  </span>
+                </div>
+                <ul className="min-h-0 flex-1 space-y-1.5 overflow-hidden py-0.5">
+                  {tvActionLines.length === 0 ? (
+                    <li className="text-sm text-zinc-500">
+                      Sin acciones ligadas a incremento en el periodo.
+                    </li>
+                  ) : (
+                    tvActionLines.map((line, i) => {
+                      const metricBadge = insightMetricBadgeForLine(line);
+                      return (
+                        <li
+                          key={`act-${i}-${line.slice(0, 16)}`}
+                          className="flex gap-2.5 rounded-lg border border-zinc-800/50 bg-black/20 px-2.5 py-2"
+                        >
+                          <ListTodo
+                            className="mt-0.5 h-4 w-4 shrink-0 text-violet-500/80"
+                            aria-hidden
+                          />
+                          <div className="min-w-0 flex-1">
+                            {metricBadge ? (
+                              <span className="mb-1 inline-block rounded border border-zinc-600/80 bg-zinc-900/80 px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wide text-violet-300/90">
+                                {metricBadge}
+                              </span>
+                            ) : null}
+                            <span className="text-xs leading-relaxed text-zinc-200 sm:text-sm">
+                              {insightPlainText(line)}
+                            </span>
+                          </div>
+                        </li>
+                      );
+                    })
+                  )}
+                </ul>
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        {!kiosk ? (
+          <footer className="mt-1 shrink-0 border-t border-zinc-800/80 px-2 py-2 max-sm:pb-[max(0.25rem,env(safe-area-inset-bottom,0px))] sm:mt-0 sm:px-3 sm:py-1.5">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-zinc-500 max-sm:text-sm">
               <button
                 type="button"
                 onClick={() => void load()}
                 disabled={loading}
-                className="rounded-lg border border-teal-700/60 bg-teal-950/40 px-4 py-2 text-sm font-medium text-teal-100 transition hover:border-teal-500 hover:bg-teal-900/50 disabled:opacity-50"
+                className="touch-manipulation font-mono min-h-10 px-1 hover:text-zinc-400 disabled:opacity-40 sm:min-h-0"
               >
-                {loading ? "Cargando…" : meta.persistEnabled ? "Recargar (Neon)" : "Recargar"}
+                Cuentas
               </button>
               {meta.persistEnabled ? (
-                <button
-                  type="button"
-                  onClick={() => void load({ live: true })}
-                  disabled={loading}
-                  className="rounded-lg border border-zinc-600 bg-zinc-900/60 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-zinc-500 disabled:opacity-50"
-                >
-                  Ver en vivo (Google)
-                </button>
-              ) : null}
-              {meta.persistEnabled ? (
-                <button
-                  type="button"
-                  onClick={() => void syncFromGoogle()}
-                  disabled={syncing || loading}
-                  className="rounded-lg border border-violet-700/50 bg-violet-950/40 px-4 py-2 text-sm font-medium text-violet-100 transition hover:border-violet-500 hover:bg-violet-900/40 disabled:opacity-50"
-                >
-                  {syncing ? "Sincronizando…" : "Sincronizar → Neon"}
-                </button>
-              ) : null}
-              <Link
-                href="/traffic"
-                className="inline-flex items-center rounded-lg border border-violet-600/40 bg-transparent px-4 py-2 text-sm font-medium text-violet-300/90 transition hover:border-violet-500 hover:bg-violet-950/25"
-              >
-                Ir a tráfico
-              </Link>
-            </div>
-            {!meta.persistEnabled && !loading ? (
-              <p className="mt-3 text-xs text-zinc-500">
-                Sin <code className="rounded bg-zinc-800 px-1 font-mono text-zinc-400">DATABASE_URL</code> solo se
-                consulta Google en vivo; añade Neon en <code className="font-mono text-zinc-400">.env.local</code> para
-                guardar inventario.
-              </p>
-            ) : null}
-          </div>
-        </section>
-
-        {loading && accounts === null && !error && (
-          <p className="animate-pulse text-zinc-500">Cargando cuentas…</p>
-        )}
-
-        {error && (
-          <div
-            className="mb-8 rounded-xl border border-rose-900/60 bg-rose-950/30 p-6 text-rose-100"
-            role="alert"
-          >
-            <p className="font-medium text-rose-200">Error al obtener datos</p>
-            <p className="mt-2 font-mono text-sm text-rose-100/90">{error.error}</p>
-            {error.code ? (
-              <p className="mt-1 font-mono text-xs text-rose-300/80">Código: {error.code}</p>
-            ) : null}
-            {error.hint ? (
-              <p className="mt-4 text-sm leading-relaxed text-rose-200/80">{error.hint}</p>
-            ) : null}
-          </div>
-        )}
-
-        {!loading &&
-          accounts &&
-          accounts.length === 0 &&
-          meta.persistEnabled &&
-          meta.source === "database" && (
-            <p className="mb-8 rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-3 text-sm text-amber-100/90">
-              La base de datos aún no tiene filas. Usa <strong>Sincronizar → Neon</strong> (requiere credenciales de
-              Google Analytics) o revisa que hayas ejecutado{" "}
-              <code className="font-mono text-xs text-amber-200">db/schema.sql</code> en Neon.
-            </p>
-          )}
-
-        {!loading &&
-          accounts &&
-          accounts.length === 0 &&
-          !(meta.persistEnabled && meta.source === "database") && (
-            <div className="mb-8 rounded-xl border border-sky-900/50 bg-sky-950/20 px-5 py-4 text-sm leading-relaxed text-sky-100/90">
-              <p className="font-medium text-sky-200">No hay cuentas visibles para esta identidad</p>
-              <p className="mt-2 text-sky-100/80">
-                La conexión a la API de Google suele estar bien; el resultado vacío casi siempre significa que la{" "}
-                <strong>cuenta de servicio</strong> no tiene acceso en la interfaz de Analytics.
-              </p>
-              <ol className="mt-4 list-decimal space-y-2 pl-5 text-sky-100/75">
-                <li>
-                  En{" "}
-                  <a
-                    href="https://analytics.google.com/"
-                    className="text-sky-300 underline decoration-sky-600 underline-offset-2 hover:text-sky-200"
-                    target="_blank"
-                    rel="noopener noreferrer"
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void load({ live: true })}
+                    disabled={loading}
+                    className="touch-manipulation font-mono min-h-10 px-1 hover:text-zinc-400 disabled:opacity-40 sm:min-h-0"
                   >
-                    Google Analytics
-                  </a>
-                  , abre <strong>Administrador</strong> (engranaje) y elige la cuenta donde quieres dar acceso.
-                </li>
-                <li>
-                  Ve a <strong>Administración de acceso a la cuenta</strong> (o acceso a la propiedad) →{" "}
-                  <strong>+ Añadir usuarios</strong>.
-                </li>
-                <li>
-                  Pega el correo que aparece en tu JSON de credenciales, campo{" "}
-                  <code className="rounded bg-sky-950 px-1 font-mono text-xs text-sky-200">client_email</code> (termina
-                  en <span className="font-mono text-xs text-sky-300">@...iam.gserviceaccount.com</span>).
-                </li>
-                <li>
-                  Asigna rol <strong>Lector</strong> (o superior), guarda y espera unos segundos.
-                </li>
-              </ol>
-              <p className="mt-4 text-sky-100/70">
-                Luego pulsa <strong>Ver en vivo (Google)</strong> o <strong>Sincronizar → Neon</strong>. Cuando haya
-                datos, usa <Link href="/traffic" className="font-medium text-sky-300 underline">Tráfico</Link> para
-                visitas.
-              </p>
+                    Live
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void syncFromGoogle()}
+                    disabled={syncing || loading}
+                    className="touch-manipulation font-mono min-h-10 px-1 hover:text-zinc-400 disabled:opacity-40 sm:min-h-0"
+                  >
+                    Sync
+                  </button>
+                </>
+              ) : null}
+              <span className="font-mono leading-snug">
+                {stats.properties} prop. · {meta.source === "database" ? "Neon" : "API"}
+                {meta.syncedAt ? ` · ${formatUtcDateTimeForDisplay(meta.syncedAt)}` : ""}
+              </span>
             </div>
-          )}
-
-        {accounts && accounts.length > 0 && (
-          <ul className="space-y-4">
-            {accounts.map((acc) => (
-              <li
-                key={acc.account || acc.name}
-                className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/40 shadow-lg shadow-black/20"
-              >
-                <div className="border-b border-zinc-800 bg-zinc-900/80 px-5 py-4">
-                  <h3 className="text-lg font-medium text-white">{acc.displayName || "(Sin nombre)"}</h3>
-                  <p className="mt-1 font-mono text-xs text-zinc-500">{acc.account}</p>
-                </div>
-                {acc.propertySummaries.length === 0 ? (
-                  <p className="px-5 py-4 text-sm text-zinc-500">Sin propiedades en el resumen.</p>
-                ) : (
-                  <ul className="divide-y divide-zinc-800/80">
-                    {acc.propertySummaries.map((p) => (
-                      <li key={p.property} className="px-5 py-3.5">
-                        <div className="flex flex-col gap-1 sm:flex-row sm:items-baseline sm:justify-between">
-                          <span className="font-medium text-zinc-200">{p.displayName}</span>
-                          {p.propertyType ? (
-                            <span className="font-mono text-xs text-teal-500/90">{p.propertyType}</span>
-                          ) : null}
-                        </div>
-                        <p className="mt-1 font-mono text-[11px] text-zinc-600">{p.property}</p>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
+            {error ? (
+              <p className="mt-1 text-sm text-rose-400">{error.error}</p>
+            ) : null}
+          </footer>
+        ) : error ? (
+          <div className="mt-1 shrink-0 border-t border-rose-900/40 px-2 py-2 font-mono text-[9px] text-rose-400 sm:py-1">
+            {error.error}
+          </div>
+        ) : null}
+        </div>
+        </div>
       </div>
     </div>
   );

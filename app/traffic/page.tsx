@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { PropertyNameWithBrandIcon } from "@/components/property-name-with-brand-icon";
 import { TrafficCharts } from "@/components/traffic-charts";
 
 type TrafficRow = {
@@ -12,6 +13,7 @@ type TrafficRow = {
   totalUsers: number;
   screenPageViews: number;
   error?: string;
+  neonSubscriberCount?: number | null;
 };
 
 type ApiOk = {
@@ -22,6 +24,10 @@ type ApiOk = {
   userIdFilterActive?: boolean;
   excludedUserIdCount?: number;
   locations?: Array<{ country: string; sessions: number }>;
+  neonSubscribers?: {
+    byBrand: Record<string, number>;
+    errors?: Array<{ brand: string; message: string }>;
+  };
 };
 
 type ApiErr = { error: string; code?: string; hint?: string };
@@ -45,7 +51,7 @@ export default function TrafficPage() {
   const [data, setData] = useState<ApiOk | null>(null);
   const [error, setError] = useState<ApiErr | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (forceRefresh?: boolean) => {
     setLoading(true);
     setError(null);
     try {
@@ -55,6 +61,9 @@ export default function TrafficPage() {
       }
       if (includeLocations) {
         q.set("locations", "1");
+      }
+      if (forceRefresh) {
+        q.set("refresh", "1");
       }
       const res = await fetch(`/api/analytics/traffic?${q}`, { cache: "no-store" });
       const body = (await res.json()) as ApiOk & ApiErr;
@@ -150,7 +159,7 @@ export default function TrafficPage() {
             </label>
             <button
               type="button"
-              onClick={() => void load()}
+              onClick={() => void load(true)}
               disabled={loading}
               className="rounded-lg border border-violet-600/60 bg-violet-950/50 px-4 py-2 text-sm font-medium text-violet-100 hover:border-violet-400 disabled:opacity-50"
             >
@@ -187,6 +196,20 @@ export default function TrafficPage() {
 
         {data && data.rows.length > 0 && (
           <>
+            {data.neonSubscribers ? (
+              <p className="mb-4 font-mono text-xs text-cyan-400/90">
+                Suscriptores Neon (por marca):{" "}
+                {Object.entries(data.neonSubscribers.byBrand)
+                  .map(([b, n]) => `${b} ${fmt(n)}`)
+                  .join(" · ")}
+                {data.neonSubscribers.errors?.length ? (
+                  <span className="ml-2 text-rose-400/90">
+                    ({data.neonSubscribers.errors.length} error(es))
+                  </span>
+                ) : null}
+              </p>
+            ) : null}
+
             <TrafficCharts
               rows={data.rows}
               days={data.days}
@@ -206,6 +229,11 @@ export default function TrafficPage() {
                       <th className="px-4 py-3 text-right font-medium">Sesiones</th>
                       <th className="px-4 py-3 text-right font-medium">Usuarios</th>
                       <th className="px-4 py-3 text-right font-medium">Vistas</th>
+                      {data.neonSubscribers ? (
+                        <th className="px-4 py-3 text-right font-medium text-cyan-500/90" title="Neon">
+                          Sus.
+                        </th>
+                      ) : null}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-zinc-800/90">
@@ -213,7 +241,9 @@ export default function TrafficPage() {
                       <tr key={r.property} className="bg-zinc-950/40 hover:bg-zinc-900/50">
                         <td className="px-4 py-3 text-zinc-400">{r.accountDisplayName}</td>
                         <td className="px-4 py-3">
-                          <div className="font-medium text-zinc-100">{r.propertyDisplayName}</div>
+                          <div className="font-medium text-zinc-100">
+                            <PropertyNameWithBrandIcon displayName={r.propertyDisplayName} />
+                          </div>
                           <div className="font-mono text-[11px] text-zinc-600">{r.property}</div>
                           {r.error ? (
                             <div className="mt-1 text-xs text-amber-400/90">{r.error}</div>
@@ -228,6 +258,11 @@ export default function TrafficPage() {
                         <td className="px-4 py-3 text-right font-mono tabular-nums text-zinc-200">
                           {fmt(r.screenPageViews)}
                         </td>
+                        {data.neonSubscribers ? (
+                          <td className="px-4 py-3 text-right font-mono tabular-nums text-cyan-300/90">
+                            {r.neonSubscriberCount != null ? fmt(r.neonSubscriberCount) : "—"}
+                          </td>
+                        ) : null}
                       </tr>
                     ))}
                   </tbody>
@@ -245,6 +280,7 @@ export default function TrafficPage() {
                       <td className="px-4 py-4 text-right font-mono tabular-nums">
                         {fmt(data.totals.screenPageViews)}
                       </td>
+                      {data.neonSubscribers ? <td className="px-4 py-4" aria-hidden /> : null}
                     </tr>
                   </tfoot>
                 </table>

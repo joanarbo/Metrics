@@ -1,0 +1,17 @@
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[functions]
+  directory = "netlify/functions"
+
+# Tres veces al día (UTC): precalienta caché de insights en Neon.
+[[scheduled.functions]]
+  name = "insights-warmup-scheduled"
+  cron = "0 7,15,23 * * *"

@@ -23,6 +23,11 @@ export type TrafficChartRow = {
   totalUsers: number;
   screenPageViews: number;
   error?: string;
+  /** Suscriptores (Neon) por marca, si está configurado NEON_SUBSCRIBER_SOURCES. */
+  neonSubscriberCount?: number | null;
+  /** Sesiones últimos 7 días (GA4), si `strip=1` en la API. */
+  sessionsLast7Days?: number;
+  sessionsPrev7Days?: number;
 };
 
 const CHART_TEXT = "#a1a1aa";
@@ -97,9 +102,11 @@ type Props = {
   days: number;
   /** Alturas menores para embebido en home */
   compact?: boolean;
+  /** Solo barras agrupadas (sin donut ni proporción circular). */
+  variant?: "full" | "barsOnly";
 };
 
-export function TrafficCharts({ rows, locations, days, compact }: Props) {
+export function TrafficCharts({ rows, locations, days, compact, variant = "full" }: Props) {
   const ok = rows.filter((r) => !r.error);
   const labels = ok.map((r) => shortLabel(r.propertyDisplayName));
 
@@ -187,11 +194,14 @@ export function TrafficCharts({ rows, locations, days, compact }: Props) {
 
   const hBar = compact ? "h-56 sm:h-64" : "h-80";
   const hCountry = compact ? "h-64 max-w-2xl" : "h-[min(28rem,70vh)] max-w-3xl";
+  const barsOnly = variant === "barsOnly";
 
   return (
     <div className={compact ? "space-y-6" : "space-y-10"}>
-      <div className={`grid gap-8 ${compact ? "lg:grid-cols-2" : "lg:grid-cols-2"}`}>
-        <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-4">
+      <div className={`grid gap-8 ${barsOnly ? "" : compact ? "lg:grid-cols-2" : "lg:grid-cols-2"}`}>
+        <div
+          className={`rounded-xl border border-zinc-800 bg-zinc-950/50 p-4 ${barsOnly ? "max-w-4xl" : ""}`}
+        >
           <h2 className="mb-2 text-sm font-medium text-zinc-300">
             Métricas por propiedad (agrupadas)
           </h2>
@@ -211,13 +221,15 @@ export function TrafficCharts({ rows, locations, days, compact }: Props) {
             />
           </div>
         </div>
-        <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-4">
-          <h2 className="mb-2 text-sm font-medium text-zinc-300">Sesiones por site</h2>
-          <p className="mb-4 text-xs text-zinc-500">Proporción respecto al total de sesiones del periodo.</p>
-          <div className={hBar}>
-            <Doughnut data={doughnutData} options={doughnutOptions} />
+        {!barsOnly ? (
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-4">
+            <h2 className="mb-2 text-sm font-medium text-zinc-300">Sesiones por site</h2>
+            <p className="mb-4 text-xs text-zinc-500">Proporción respecto al total de sesiones del periodo.</p>
+            <div className={hBar}>
+              <Doughnut data={doughnutData} options={doughnutOptions} />
+            </div>
           </div>
-        </div>
+        ) : null}
       </div>
 
       {loc ? (
