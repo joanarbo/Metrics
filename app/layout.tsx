@@ -1,6 +1,9 @@
 import type { Metadata, Viewport } from "next";
+import { ClerkProvider } from "@clerk/nextjs";
+import { esES } from "@clerk/localizations";
 import { Geist, Geist_Mono } from "next/font/google";
 import { AuthGate } from "@/components/auth-gate";
+import { isClerkAuthSkipped } from "@/lib/auth-env";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -41,13 +44,20 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const skipAuth = isClerkAuthSkipped();
+  const shell = <AuthGate>{children}</AuthGate>;
+
   return (
     <html
       lang="es"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="flex min-h-full flex-col font-sans antialiased">
-        <AuthGate>{children}</AuthGate>
+        {skipAuth ? (
+          shell
+        ) : (
+          <ClerkProvider localization={esES}>{shell}</ClerkProvider>
+        )}
       </body>
     </html>
   );

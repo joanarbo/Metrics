@@ -16,7 +16,7 @@ import {
 import { matchInsightLineToPropertyId } from "@/lib/dashboard/match-insight-property";
 import { pickCardInsights } from "@/lib/dashboard/pick-card-insights";
 import { formatUtcDateTimeForDisplay } from "@/lib/format-datetime";
-import { isNetlifyAuthSkipped } from "@/lib/identity";
+import { isClerkAuthSkipped } from "@/lib/auth-env";
 import { ga4PropertyReportsUrl } from "@/lib/ga/ga4-web-url";
 import type { AccountRow } from "@/lib/ga/account-summaries";
 import {
@@ -275,7 +275,7 @@ function insightPlainText(text: string): ReactNode {
 export function HomePageClient() {
   const searchParams = useSearchParams();
   const kiosk = useMemo(() => readKioskMode(searchParams), [searchParams]);
-  const authSkipped = useMemo(() => isNetlifyAuthSkipped(), []);
+  const authSkipped = useMemo(() => isClerkAuthSkipped(), []);
 
   const [accounts, setAccounts] = useState<AccountRow[] | null>(null);
   const [loading, setLoading] = useState(true);
