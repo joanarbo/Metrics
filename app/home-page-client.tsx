@@ -507,24 +507,17 @@ export function HomePageClient() {
     [periodPreset, useStoredTraffic],
   );
 
-  /** GA4 + IA con refresh=1 (Neon), luego precache de periodos como el cron. */
-  const refreshAllAndPrecacheNeon = useCallback(async () => {
+  /** GA4 + IA con refresh=1 (Neon) para el periodo seleccionado actual. */
+  const refreshCurrentPeriod = useCallback(async () => {
     setFullRefreshLoading(true);
     setWarmupError(null);
     try {
-      const first = await loadTrafficAndInsights({ forceRefresh: true });
-      if (!first.ok) {
-        return;
-      }
-      const res = await fetch("/api/insights/warmup", { method: "POST" });
-      const j = (await res.json()) as { ok?: boolean; error?: string; results?: unknown };
+      const res = await loadTrafficAndInsights({ forceRefresh: true });
       if (!res.ok) {
-        setWarmupError(typeof j.error === "string" ? j.error : res.statusText);
-        return;
+        setWarmupError("No se pudo refrescar los datos.");
       }
-      await loadTrafficAndInsights();
     } catch (e) {
-      setWarmupError(e instanceof Error ? e.message : "Red");
+      setWarmupError(e instanceof Error ? e.message : "Error de red");
     } finally {
       setFullRefreshLoading(false);
     }
@@ -565,17 +558,18 @@ export function HomePageClient() {
     return copy;
   }, [homeTraffic?.rows]);
 
-  /** Hasta 5 marcas: una sola fila en desktop (menos hueco vacío a la derecha). */
+  /** Hasta 5 marcas: una sola fila en desktop (menos hueco vacío a la derecha). En móvil: carrusel horizontal. */
   const projectGridClass = useMemo(() => {
     const n = projectCardRows.length;
-    if (n <= 0) return "grid w-full grid-cols-1 gap-1.5";
+    const base = "flex max-sm:w-[calc(100vw-1.25rem)] max-sm:-mx-1 max-sm:px-1 max-sm:overflow-x-auto max-sm:snap-x max-sm:snap-mandatory max-sm:pb-4 gap-2 sm:grid content-start sm:pr-0.5 sm:[scrollbar-gutter:stable]";
+    if (n <= 0) return `${base} sm:grid-cols-1`;
     if (n <= 5) {
-      return "grid w-full grid-cols-1 content-start gap-1.5 pr-0.5 [scrollbar-gutter:stable] sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5";
+      return `${base} sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5`;
     }
     if (n <= 6) {
-      return "grid w-full grid-cols-1 content-start gap-1.5 pr-0.5 [scrollbar-gutter:stable] sm:grid-cols-2 lg:grid-cols-3";
+      return `${base} sm:grid-cols-2 lg:grid-cols-3`;
     }
-    return "grid w-full grid-cols-1 content-start gap-1.5 pr-0.5 [scrollbar-gutter:stable] sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4";
+    return `${base} sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4`;
   }, [projectCardRows.length]);
 
   const trafficRowsForInsights = homeTraffic?.rows ?? [];
@@ -689,19 +683,19 @@ export function HomePageClient() {
       {!kiosk ? (
         <button
           type="button"
-          onClick={() => void refreshAllAndPrecacheNeon()}
+          onClick={() => void refreshCurrentPeriod()}
           disabled={fullRefreshLoading || homeTrafficLoading || insightsLoading}
-          title="Actualiza tráfico GA4 e IA (sin leer caché), guarda en Neon; luego precalienta todos los periodos del cron (INSIGHTS_CRON_*)."
+          title="Actualiza tráfico GA4 e IA (sin leer caché) para el periodo actual y lo guarda en Neon."
           className="hidden touch-manipulation rounded border border-emerald-800/55 bg-emerald-950/45 px-2.5 py-1.5 font-mono text-[10px] font-semibold text-emerald-200/95 disabled:opacity-40 sm:inline-flex sm:min-h-0 sm:items-center"
         >
-          {fullRefreshLoading ? "…" : "Refrescar + Neon"}
+          {fullRefreshLoading ? "…" : "Refrescar"}
         </button>
       ) : (
         <button
           type="button"
-          onClick={() => void refreshAllAndPrecacheNeon()}
+          onClick={() => void refreshCurrentPeriod()}
           disabled={fullRefreshLoading || homeTrafficLoading || insightsLoading}
-          title="Refrescar todo y precachear en Neon"
+          title="Actualizar datos y guardar en Neon"
           className="inline-flex min-h-8 touch-manipulation items-center rounded border border-emerald-800/60 bg-emerald-950/40 px-2 py-1 font-mono text-[10px] text-emerald-300 disabled:opacity-40"
         >
           {fullRefreshLoading ? "…" : "↻"}
@@ -745,7 +739,7 @@ export function HomePageClient() {
   );
 
   return (
-    <div className="flex max-h-dvh min-h-dvh flex-col overflow-hidden bg-[#07090c] font-sans text-zinc-100 max-sm:max-h-dvh max-sm:min-h-dvh">
+    <div className="flex min-h-dvh flex-col bg-[#07090c] font-sans text-zinc-100 max-sm:h-auto max-sm:overflow-y-auto sm:max-h-dvh sm:min-h-dvh sm:overflow-hidden">
       <header
         className={`relative z-20 shrink-0 border-b border-zinc-800/80 pt-[env(safe-area-inset-top,0px)] ${
           kiosk
@@ -783,12 +777,12 @@ export function HomePageClient() {
               <div className="flex shrink-0 items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => void refreshAllAndPrecacheNeon()}
+                  onClick={() => void refreshCurrentPeriod()}
                   disabled={fullRefreshLoading || homeTrafficLoading || insightsLoading}
-                  title="Actualiza GA4 e IA (sin caché), guarda en Neon y precalienta periodos del cron"
+                  title="Actualiza GA4 e IA (sin caché) para el periodo actual y lo guarda en Neon"
                   className="touch-manipulation rounded-lg border border-emerald-800/55 bg-emerald-950/45 px-3 py-2 font-mono text-[11px] font-semibold text-emerald-200/95 disabled:opacity-40"
                 >
-                  {fullRefreshLoading ? "…" : "Refrescar + Neon"}
+                  {fullRefreshLoading ? "…" : "Refrescar"}
                 </button>
               </div>
             </div>
@@ -811,21 +805,24 @@ export function HomePageClient() {
         )}
       </header>
 
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="flex min-h-0 flex-1 flex-col max-sm:overflow-visible sm:overflow-hidden">
         <div
           ref={fitContainerRef}
-          className={`touch-pan-y-safe mx-auto flex min-h-0 w-full max-w-[1440px] flex-1 flex-col overflow-hidden max-sm:pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] ${
+          className={`touch-pan-y-safe mx-auto flex min-h-0 w-full max-w-[1440px] flex-1 flex-col max-sm:overflow-visible sm:overflow-hidden max-sm:pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] ${
             kiosk ? "p-1.5 sm:p-2" : "p-2.5 sm:p-4"
           }`}
         >
         <div
           ref={fitContentRef}
-          className={`flex w-full flex-col origin-top ${kiosk ? "gap-1.5" : "gap-2"}`}
-          style={{
-            transform: `scale(${fitScale})`,
-            transformOrigin: "top center",
-            ...(fitScale < 1 ? { width: `${100 / fitScale}%` } : {}),
-          }}
+          className={`flex w-full flex-col origin-top ${kiosk ? "gap-1.5" : "gap-2"} max-sm:![transform:none] max-sm:!w-full`}
+          style={
+            {
+              "--fit-scale": fitScale,
+              transform: `scale(var(--fit-scale))`,
+              transformOrigin: "top center",
+              ...(fitScale < 1 ? { width: `${100 / fitScale}%` } : {}),
+            } as React.CSSProperties
+          }
         >
         {homeTrafficError ? (
           <div
@@ -928,29 +925,30 @@ export function HomePageClient() {
                   ? stripLabels
                   : null;
               return (
-                <DashboardProjectCard
-                  key={r.property}
-                  propertyId={r.property}
-                  displayName={r.propertyDisplayName}
-                  brand={brand}
-                  days={homeTraffic.days}
-                  sessions={r.sessions}
-                  sessionsChangePct={r.sessionsChangePct}
-                  compareActive={compareActive}
-                  sessionsLast7Days={r.sessionsLast7Days}
-                  sessionsWeekOverWeekPct={r.sessionsWeekOverWeekPct}
-                  neonSubscriberCount={r.neonSubscriberCount ?? null}
-                  neonSubscriberChangePct={r.neonSubscriberChangePct ?? null}
-                  neonWeeklyValues={nw?.values ?? null}
-                  neonWeeklyLabels={nw?.labels ?? null}
-                  neonWeeklySynthetic={nw?.synthetic ?? false}
-                  visitBucketLabels={labelsForBuckets}
-                  visitBucketSessions={buckets}
-                  insightAlert={cardInsight.alert}
-                  insightAction={cardInsight.action}
-                  insightsLoading={insightsLoading}
-                  insightsUnavailableNote={insightsUnavailableNoteGlobal}
-                />
+                <div key={r.property} className="flex min-w-0 flex-col max-sm:w-[90vw] max-sm:shrink-0 max-sm:snap-center">
+                  <DashboardProjectCard
+                    propertyId={r.property}
+                    displayName={r.propertyDisplayName}
+                    brand={brand}
+                    days={homeTraffic.days}
+                    sessions={r.sessions}
+                    sessionsChangePct={r.sessionsChangePct}
+                    compareActive={compareActive}
+                    sessionsLast7Days={r.sessionsLast7Days}
+                    sessionsWeekOverWeekPct={r.sessionsWeekOverWeekPct}
+                    neonSubscriberCount={r.neonSubscriberCount ?? null}
+                    neonSubscriberChangePct={r.neonSubscriberChangePct ?? null}
+                    neonWeeklyValues={nw?.values ?? null}
+                    neonWeeklyLabels={nw?.labels ?? null}
+                    neonWeeklySynthetic={nw?.synthetic ?? false}
+                    visitBucketLabels={labelsForBuckets}
+                    visitBucketSessions={buckets}
+                    insightAlert={cardInsight.alert}
+                    insightAction={cardInsight.action}
+                    insightsLoading={insightsLoading}
+                    insightsUnavailableNote={insightsUnavailableNoteGlobal}
+                  />
+                </div>
               );
             })}
           </div>
